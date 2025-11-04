@@ -9,6 +9,7 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 import re
+from .common import gpt2_bytes_to_unicode
 
 def run_linear(
     d_in: int,
@@ -601,60 +602,78 @@ def run_train_bpe(
         if st:
             text = text.replace(st, f" {st} ")
 
-    # 预分词 (pre-tokenization): 将文本拆为单词/标点等基本单元
-    # 使用 \w+ 捕获字母数字序列，其它单字符（标点等）作为独立 token
-    tokens = re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE)
+    # Pre-tokenization: 按空白分割（与 Sennrich et al. 示例一致）
+    words = [w for w in text.split() if w != ""]
 
-    # 将预分词结果转为按字节的 BPE 初始 token 列表（每个单元变为字符 bytes 序列并加 end marker）
-    tokenized_words: list[list[bytes]] = []
-    for tok in tokens:
-        # 保留空串检查
-        if not tok:
-            continue
-        # 完整保留 special token（不拆分）
-        if tok in special_tokens:
-            tokenized_words.append([tok.encode("utf-8"), end_marker])
-            continue
-        # 将 token 拆为字符并编码为 bytes（保持多字节字符正确）
-        chars = [ch.encode("utf-8") for ch in tok]
-        chars.append(end_marker)
-        tokenized_words.append(chars)
+    # 统计每个 pretokenized 单词的出现频率
+    from collections import Counter
 
-    # 初始 vocab 集合（包含所有单字节/字符 token 与 special tokens）
-    vocab_set: set[bytes] = set()
-    for w in tokenized_words:
-        for t in w:
-            vocab_set.add(t)
-    for st in special_tokens:
-        vocab_set.add(st.encode("utf-8"))
+    word_counts = Counter(words)
+
+    # 将每个单词表示为一个 bytes token tuple（按字节拆分），在末尾添加 end_marker
+    # special tokens 保持为单个 bytes 元素（也附上 end_marker 以避免越界合并）
+    word_to_tokens: dict[tuple[bytes, ...], int] = {}
+    special_bytes = {st.encode("utf-8") for st in special_tokens}
+    for word, cnt in word_counts.items():
+        if word in special_tokens:
+            toks = (word.encode("utf-8"), end_marker)
+        else:
+            b = word.encode("utf-8")
+            # 将每个字节表示为长度为1的 bytes 对象
+            bytes_seq = tuple(bytes([bb]) for bb in b) + (end_marker,)
+            toks = bytes_seq
+        word_to_tokens[toks] = cnt
 
     merges: list[tuple[bytes, bytes]] = []
 
-    # BPE 合并循环，直到达到 vocab_size 或无可合并对
+    # 初始 vocab 集合：包含 special tokens、</w>，以及 GPT-2 的 256 个字节（按 gpt2 order）
+    gpt2_order_bytes = [bytes([b]) for b in gpt2_bytes_to_unicode().keys()]
+
+    def build_vocab_from_words(words_map: dict[tuple[bytes, ...], int]) -> set[bytes]:
+        s: set[bytes] = set()
+        for w in words_map:
+            for t in w:
+                s.add(t)
+        for st in special_tokens:
+            s.add(st.encode("utf-8"))
+        s.add(end_marker)
+        # ensure all 256 bytes are present
+        for b in gpt2_order_bytes:
+            s.add(b)
+        return s
+
+    vocab_set = build_vocab_from_words(word_to_tokens)
+
+    # BPE 合并循环 — 统计 pair 频率时用单词频率加权
+    # IMPORTANT: do not allow merges that include special token bytes (protect them)
     while len(vocab_set) < vocab_size:
-        # 统计相邻 pair 频率
         pair_freq: dict[tuple[bytes, bytes], int] = {}
-        for w in tokenized_words:
+
+        for w, cnt in word_to_tokens.items():
             for i in range(len(w) - 1):
-                pair = (w[i], w[i + 1])
-                pair_freq[pair] = pair_freq.get(pair, 0) + 1
+                a, b = w[i], w[i + 1]
+                # skip pairs that involve protected special tokens
+                if a in special_bytes or b in special_bytes:
+                    continue
+                pair = (a, b)
+                pair_freq[pair] = pair_freq.get(pair, 0) + cnt
 
         if not pair_freq:
             break
 
-        # 选择频率最高的 pair；若并列则按字节序确定（保证确定性）
+        # 选择出现次数最多的 pair；平局时取 lexicographically greater（与示例一致）
         max_freq = max(pair_freq.values())
         best_pairs = [p for p, f in pair_freq.items() if f == max_freq]
-        best_pair = min(best_pairs)
+        best_pair = max(best_pairs)
 
-        # 合并该 pair（简单的字节连接）
+        # 合并该 pair（按 bytes 直接连接）
         merged = best_pair[0] + best_pair[1]
 
-        # 在所有单词中替换该 pair（非重叠左到右）
-        new_tokenized: list[list[bytes]] = []
-        for w in tokenized_words:
-            i = 0
+        # 在所有单词中替换该 pair（非重叠、从左到右）并保留计数
+        new_word_to_tokens: dict[tuple[bytes, ...], int] = {}
+        for w, cnt in word_to_tokens.items():
             new_w: list[bytes] = []
+            i = 0
             while i < len(w):
                 if i < len(w) - 1 and (w[i], w[i + 1]) == best_pair:
                     new_w.append(merged)
@@ -662,17 +681,21 @@ def run_train_bpe(
                 else:
                     new_w.append(w[i])
                     i += 1
-            new_tokenized.append(new_w)
-        tokenized_words = new_tokenized
+            new_word_to_tokens[tuple(new_w)] = new_word_to_tokens.get(tuple(new_w), 0) + cnt
 
-        vocab_set.add(merged)
+        word_to_tokens = new_word_to_tokens
+
         merges.append(best_pair)
+        vocab_set = build_vocab_from_words(word_to_tokens)
 
-        # 防止死循环：若 vocab 达到或超过目标则退出
+        # 防止死循环
         if len(vocab_set) >= vocab_size:
             break
 
-    # 构造最终 vocab 列表：先 special_tokens 原序，再按字节排序其余 token，最后截断到 vocab_size
+    # 构造最终 vocab 列表：
+    # 1) special tokens（原序）
+    # 2) GPT-2 的 256 个 bytes（按 gpt2_bytes_to_unicode 中的顺序）
+    # 3) 按 merges 的创建顺序追加新合并的 tokens
     seen: set[bytes] = set()
     vocab_list: list[bytes] = []
     for st in special_tokens:
@@ -681,12 +704,29 @@ def run_train_bpe(
             vocab_list.append(b)
             seen.add(b)
 
-    remaining = sorted([t for t in vocab_set if t not in seen])
-    for t in remaining:
-        vocab_list.append(t)
+    # append GPT-2 bytes in their canonical order
+    for b in gpt2_order_bytes:
+        if b not in seen:
+            vocab_list.append(b)
+            seen.add(b)
+
+    # append merged tokens in creation order
+    for a, b in merges:
+        merged = a + b
+        if merged not in seen:
+            vocab_list.append(merged)
+            seen.add(merged)
+
+    # finally, if still space left (rare), append any remaining tokens sorted deterministically
+    if len(vocab_list) < vocab_size:
+        remaining = sorted([t for t in vocab_set if t not in seen])
+        for t in remaining:
+            if len(vocab_list) >= vocab_size:
+                break
+            vocab_list.append(t)
+            seen.add(t)
 
     vocab_list = vocab_list[:vocab_size]
-
     vocab = {i: tok for i, tok in enumerate(vocab_list)}
 
     return vocab, merges

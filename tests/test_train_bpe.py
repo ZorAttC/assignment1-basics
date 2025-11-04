@@ -47,6 +47,19 @@ def test_train_bpe():
             )
             for merge_token_1, merge_token_2 in gpt2_reference_merges
         ]
+    # Save the learned vocab and merges for later inspection
+    vocab_out_path = FIXTURES_PATH / "train-bpe-res-vocab.json"
+    merges_out_path = FIXTURES_PATH / "res-merges.json"
+
+    # Make both structures JSON-serializable: convert bytes -> list of ints
+    serial_vocab = {str(k): list(v) if isinstance(v, (bytes, bytearray)) else v for k, v in vocab.items()}
+    serial_merges = [[list(a), list(b)] for a, b in merges]
+
+    with open(vocab_out_path, "w", encoding="utf-8") as f:
+        json.dump(serial_vocab, f, ensure_ascii=False, indent=2)
+
+    with open(merges_out_path, "w", encoding="utf-8") as f:
+        json.dump(serial_merges, f, ensure_ascii=False, indent=2)
     assert merges == reference_merges
 
     # Compare the vocab to the expected output vocab
