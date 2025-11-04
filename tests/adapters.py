@@ -8,7 +8,7 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-
+import re
 
 def run_linear(
     d_in: int,
@@ -589,4 +589,104 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    # 结束标记（词尾）
+    end_marker = b"</w>"
+
+    # 读取文本
+    with open(input_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    # 确保 special tokens 独立（在两侧加空格）
+    for st in special_tokens:
+        if st:
+            text = text.replace(st, f" {st} ")
+
+    # 预分词 (pre-tokenization): 将文本拆为单词/标点等基本单元
+    # 使用 \w+ 捕获字母数字序列，其它单字符（标点等）作为独立 token
+    tokens = re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE)
+
+    # 将预分词结果转为按字节的 BPE 初始 token 列表（每个单元变为字符 bytes 序列并加 end marker）
+    tokenized_words: list[list[bytes]] = []
+    for tok in tokens:
+        # 保留空串检查
+        if not tok:
+            continue
+        # 完整保留 special token（不拆分）
+        if tok in special_tokens:
+            tokenized_words.append([tok.encode("utf-8"), end_marker])
+            continue
+        # 将 token 拆为字符并编码为 bytes（保持多字节字符正确）
+        chars = [ch.encode("utf-8") for ch in tok]
+        chars.append(end_marker)
+        tokenized_words.append(chars)
+
+    # 初始 vocab 集合（包含所有单字节/字符 token 与 special tokens）
+    vocab_set: set[bytes] = set()
+    for w in tokenized_words:
+        for t in w:
+            vocab_set.add(t)
+    for st in special_tokens:
+        vocab_set.add(st.encode("utf-8"))
+
+    merges: list[tuple[bytes, bytes]] = []
+
+    # BPE 合并循环，直到达到 vocab_size 或无可合并对
+    while len(vocab_set) < vocab_size:
+        # 统计相邻 pair 频率
+        pair_freq: dict[tuple[bytes, bytes], int] = {}
+        for w in tokenized_words:
+            for i in range(len(w) - 1):
+                pair = (w[i], w[i + 1])
+                pair_freq[pair] = pair_freq.get(pair, 0) + 1
+
+        if not pair_freq:
+            break
+
+        # 选择频率最高的 pair；若并列则按字节序确定（保证确定性）
+        max_freq = max(pair_freq.values())
+        best_pairs = [p for p, f in pair_freq.items() if f == max_freq]
+        best_pair = min(best_pairs)
+
+        # 合并该 pair（简单的字节连接）
+        merged = best_pair[0] + best_pair[1]
+
+        # 在所有单词中替换该 pair（非重叠左到右）
+        new_tokenized: list[list[bytes]] = []
+        for w in tokenized_words:
+            i = 0
+            new_w: list[bytes] = []
+            while i < len(w):
+                if i < len(w) - 1 and (w[i], w[i + 1]) == best_pair:
+                    new_w.append(merged)
+                    i += 2
+                else:
+                    new_w.append(w[i])
+                    i += 1
+            new_tokenized.append(new_w)
+        tokenized_words = new_tokenized
+
+        vocab_set.add(merged)
+        merges.append(best_pair)
+
+        # 防止死循环：若 vocab 达到或超过目标则退出
+        if len(vocab_set) >= vocab_size:
+            break
+
+    # 构造最终 vocab 列表：先 special_tokens 原序，再按字节排序其余 token，最后截断到 vocab_size
+    seen: set[bytes] = set()
+    vocab_list: list[bytes] = []
+    for st in special_tokens:
+        b = st.encode("utf-8")
+        if b not in seen:
+            vocab_list.append(b)
+            seen.add(b)
+
+    remaining = sorted([t for t in vocab_set if t not in seen])
+    for t in remaining:
+        vocab_list.append(t)
+
+    vocab_list = vocab_list[:vocab_size]
+
+    vocab = {i: tok for i, tok in enumerate(vocab_list)}
+
+    return vocab, merges
